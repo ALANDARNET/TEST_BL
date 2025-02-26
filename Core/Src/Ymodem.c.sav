@@ -1,0 +1,426 @@
+/**
+ * @file ymodem.c
+ * @brief Implémentation complète du protocole YMODEM avec programmation flash par secteur de 2048 octets
+ *        pour un bootloader sur STM32G431.
+ *
+ * Ce module reçoit un fichier binaire via l'interface CDC en utilisant le protocole YMODEM (mode CRC),
+ * et écrit les données reçues dans le flash de l'application à partir de l'adresse 0x8010000.
+ * Chaque secteur flash est de 2048 octets. Lorsque 2048 octets sont accumulés, ils sont programmés
+ * dans le secteur correspondant.
+ *
+ * @note Cette implémentation est un exemple et doit être adaptée, notamment pour la gestion des
+ *       effacements de secteurs flash et des contraintes spécifiques de votre application.
+ */
+
+#include "inc.h"
+
+/* Taille des blocs */
+#define YMODEM_BLOCK_SIZE_128   128U
+#define YMODEM_BLOCK_SIZE_1K    1024U
+
+/* Nombre maximal de retransmissions par bloc */
+#define MAX_RETRANS             50U
+
+/* Taille maximale du nom de fichier dans l'en‐tête YMODEM */
+#define MAX_FILENAME_SIZE       64U
+
+/* Taille d'un secteur flash pour le firmware (2048 octets) */
+#define FLASH_SECTOR_SIZE       2048U
+
+/* Adresse de base du firmware dans le flash */
+#define FIRMWARE_BASE_ADDRESS   0x8010000UL
+
+
+/**
+ * @brief Structure de contexte du transfert YMODEM.
+ */
+typedef struct
+{
+    char     file_name[MAX_FILENAME_SIZE];
+    uint32_t file_size;
+    uint32_t bytes_received;
+    uint8_t  block_number;
+} YMODEM_Context_t;
+
+/* La FIFO externe s'appelle cdc_fifo et doit être déclarée dans un autre module. */
+
+/*==============================================================================
+                          PROTOTYPES LOCAUX
+==============================================================================*/
+static uint16_t YMODEM_CalcCRC16(const uint8_t *pData, uint16_t len);
+static void YMODEM_SendByte(uint8_t byte);
+static void YMODEM_SendString(const char *pStr);
+static uint8_t YMODEM_GetByte(void);
+static void YMODEM_SendACK(void);
+static void YMODEM_SendNAK(void);
+static int CDC_GetByteTimeout(uint32_t timeout_ms, uint8_t *pByte);
+static int YMODEM_ReceiveBlock(uint8_t *pBuffer, uint16_t *pBlockSize);
+static int Flash_WriteSector(uint32_t address, uint8_t *data, uint32_t size);
+
+/*==============================================================================
+                          FONCTIONS LOCALES
+==============================================================================*/
+
+/**
+ * @brief Calcule le CRC-16 CCITT d'un tableau d'octets.
+ */
+static uint16_t YMODEM_CalcCRC16(const uint8_t *pData, uint16_t len)
+{
+    uint16_t crc = 0;
+    uint16_t i, j;
+    
+    for (i = 0; i < len; i++)
+    {
+        crc ^= ((uint16_t)pData[i] << 8U);
+        for (j = 0; j < 8U; j++)
+        {
+            if (crc & 0x8000U)
+            {
+                crc = (crc << 1U) ^ 0x1021U;
+            }
+            else
+            {
+                crc <<= 1U;
+            }
+        }
+    }
+    return crc;
+}
+
+/**
+ * @brief Envoie un octet via CDC.
+ */
+static void YMODEM_SendByte(uint8_t byte)
+{
+    (void)CDC_PutChar((char)byte);
+}
+
+/**
+ * @brief Envoie une chaîne via CDC.
+ */
+static void YMODEM_SendString(const char *pStr)
+{
+    (void)CDC_SendString(pStr);
+}
+
+/**
+ * @brief Récupère un octet de manière bloquante depuis la FIFO externe cdc_fifo.
+ *
+ * Cette fonction alimente en continu la FIFO à l'aide de CDC_GetChar() tant qu'aucun octet n'est disponible.
+ *
+ * @return uint8_t Octet récupéré.
+ */
+static uint8_t YMODEM_GetByte(void)
+{
+    uint8_t byte = 0;
+    while (!fifo_get(&cdc_fifo, &byte))
+    {
+        uint8_t temp;
+        if (CDC_GetChar(&temp))
+        {
+            fifo_put(&cdc_fifo, temp);
+        }
+        HAL_Delay(1U);
+    }
+    return byte;
+}
+
+/**
+ * @brief Envoie un ACK via CDC.
+ */
+static void YMODEM_SendACK(void)
+{
+    YMODEM_SendByte(ACK);
+}
+
+/**
+ * @brief Envoie un NAK via CDC.
+ */
+static void YMODEM_SendNAK(void)
+{
+    YMODEM_SendByte(NAK);
+}
+
+/**
+ * @brief Récupère un octet via la FIFO externe cdc_fifo avec timeout.
+ *
+ * @param[in] timeout_ms Durée maximale d'attente en millisecondes.
+ * @param[out] pByte Pointeur vers l'octet reçu.
+ * @return int 0 si réussi, -1 en cas de timeout.
+ */
+static int CDC_GetByteTimeout(uint32_t timeout_ms, uint8_t *pByte)
+{
+    uint32_t start = HAL_GetTick();
+    while ((HAL_GetTick() - start) < timeout_ms)
+    {
+        if (fifo_get(&cdc_fifo, pByte))
+        {
+            return 0;
+        }
+        else
+        {
+            uint8_t temp;
+            if (CDC_GetChar(&temp))
+            {
+                fifo_put(&cdc_fifo, temp);
+            }
+        }
+        HAL_Delay(1U);
+    }
+    return -1;
+}
+
+/**
+ * @brief Réception d'un bloc YMODEM.
+ *
+ * Lit le caractère de début (SOH ou STX), détermine la taille du bloc, lit le numéro de bloc
+ * et son complément, puis lit les données et enfin les deux octets du CRC.
+ *
+ * @param[out] pBuffer Buffer pour stocker les données.
+ * @param[out] pBlockSize Pointeur pour la taille du bloc (128 ou 1024).
+ * @return int Numéro de bloc si OK, -1 en cas d'erreur.
+ */
+static int YMODEM_ReceiveBlock(uint8_t *pBuffer, uint16_t *pBlockSize)
+{
+    uint8_t startByte = 0;
+    if (CDC_GetByteTimeout(1000U, &startByte) != 0)
+    {
+        return -1; /* Timeout sur le caractère de début */
+    }
+    
+    uint16_t block_size;
+    if (startByte == SOH)
+    {
+        block_size = YMODEM_BLOCK_SIZE_128;
+    }
+    else if (startByte == STX)
+    {
+        block_size = YMODEM_BLOCK_SIZE_1K;
+    }
+    else
+    {
+        return -1; /* Caractère de début invalide */
+    }
+    *pBlockSize = block_size;
+    
+    uint8_t block_number, block_number_inv;
+    if (CDC_GetByteTimeout(1000U, &block_number) != 0 ||
+        CDC_GetByteTimeout(1000U, &block_number_inv) != 0)
+    {
+        return -1;
+    }
+    if ((uint8_t)(block_number + block_number_inv) != 0xFFU)
+    {
+        return -1; /* Numéro de bloc erroné */
+    }
+    
+    for (uint16_t i = 0; i < block_size; i++)
+    {
+        if (CDC_GetByteTimeout(1000U, &pBuffer[i]) != 0)
+        {
+            return -1;
+        }
+    }
+    
+    uint8_t crc_high, crc_low;
+    if (CDC_GetByteTimeout(1000U, &crc_high) != 0 ||
+        CDC_GetByteTimeout(1000U, &crc_low) != 0)
+    {
+        return -1;
+    }
+    
+    uint16_t received_crc = ((uint16_t)crc_high << 8U) | crc_low;
+    uint16_t calculated_crc = YMODEM_CalcCRC16(pBuffer, block_size);
+    if (received_crc != calculated_crc)
+    {
+        return -1;
+    }
+    return (int)block_number;
+}
+
+/**
+ * @brief Écrit un secteur flash de 2048 octets à l'adresse spécifiée.
+ */
+static int Flash_WriteSector(uint32_t address, uint8_t *data, uint32_t size)
+{
+//    uint32_t i;
+//    HAL_StatusTypeDef status;
+//    
+//    status = HAL_FLASH_Unlock();
+//    if (status != HAL_OK)
+//    {
+//        return -1;
+//    }
+//    
+//    for (i = 0; i < size; i += 4U)
+//    {
+//        uint32_t word;
+//        memcpy(&word, data + i, 4U);
+//        status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, address + i, word);
+//        if (status != HAL_OK)
+//        {
+//            HAL_FLASH_Lock();
+//            return -1;
+//        }
+//    }
+//    
+//    HAL_FLASH_Lock();
+    return 0;
+}
+
+/*==============================================================================
+                          FONCTION PUBLIQUE
+==============================================================================*/
+
+/**
+ * @brief Réception d'un fichier via YMODEM et écriture en flash.
+ *
+ * Procède comme suit :
+ *   - Envoie 'C' pour demander le CRC.
+ *   - Attend le bloc d'en-tête (bloc 0) qui contient le nom et la taille du fichier.
+ *   - Si le bloc d'en-tête n'est pas vide, extrait le nom et la taille.
+ *   - Envoie ACK puis 'C' pour démarrer la réception des données.
+ *   - Réception et accumulation des blocs de données dans un tampon de FLASH_SECTOR_SIZE.
+ *   - Lorsque le tampon est plein, il est écrit en flash.
+ *   - À la réception d'un bloc EOT, les derniers octets sont programmés.
+ *
+ * @return int 0 en cas de succès, -1 en cas d'erreur.
+ */
+int YMODEM_Receive(void)
+{
+    YMODEM_Context_t context;
+    uint8_t block_buffer[YMODEM_BLOCK_SIZE_1K];
+    uint16_t block_size = 0;
+    int ret;
+    uint8_t block_no;
+    uint8_t retransmissions;
+    uint32_t flash_address = FIRMWARE_BASE_ADDRESS;
+    uint8_t flash_buffer[FLASH_SECTOR_SIZE];
+    uint32_t flash_buffer_index = 0;
+    
+    memset(&context, 0, sizeof(context));
+    context.block_number = 0;
+    context.bytes_received = 0;
+    
+    /* Initialisation de la FIFO externe cdc_fifo doit être faite ailleurs.
+       On s'assure ici qu'elle est réinitialisée. */
+    fifo_init(&cdc_fifo);
+    
+    /* Phase d'initialisation : envoi répété de 'C' et réception du bloc 0 */
+    retransmissions = 0;
+    do
+    {
+        YMODEM_SendByte(CRCCHR);
+        HAL_Delay(1000U);
+        ret = YMODEM_ReceiveBlock(block_buffer, &block_size);
+        if (ret >= 0)
+        {
+            break;
+        }
+        retransmissions++;
+    } while (retransmissions < MAX_RETRANS);
+    
+    if (retransmissions >= MAX_RETRANS)
+    {
+        return -1; /* Échec de l'initialisation */
+    }
+    
+    /* Pour le bloc d'en-tête, on attend que le numéro de bloc soit 0 */
+    if (ret != 0)
+    {
+        YMODEM_SendNAK();
+        return -1;
+    }
+    
+    /* Analyse du bloc 0 (en-tête) */
+    if (block_buffer[0] != 0)
+    {
+        (void)strncpy(context.file_name, (char *)block_buffer, MAX_FILENAME_SIZE - 1);
+        context.file_name[MAX_FILENAME_SIZE - 1] = '\0';
+        /* La taille se trouve après le nom, terminé par '\0' */
+        char *pSize = (char *)&block_buffer[strlen(context.file_name) + 1U];
+        context.file_size = (uint32_t)strtoul(pSize, NULL, 10);
+    }
+    else
+    {
+        /* Bloc d'en-tête vide, fin de transmission */
+        YMODEM_SendACK();
+        return 0;
+    }
+    
+    /* Envoi ACK pour le bloc 0 et 'C' pour démarrer le transfert des données */
+    YMODEM_SendACK();
+    YMODEM_SendByte(CRCCHR);
+    
+    /* Réception des blocs de données */
+    while (1)
+    {
+        retransmissions = 0;
+        do
+        {
+            ret = YMODEM_ReceiveBlock(block_buffer, &block_size);
+            if (ret >= 0)
+            {
+                block_no = (uint8_t)ret;
+                break;
+            }
+            else
+            {
+                YMODEM_SendNAK();
+                retransmissions++;
+            }
+        } while (retransmissions < MAX_RETRANS);
+        
+        if (retransmissions >= MAX_RETRANS)
+        {
+            return -1;
+        }
+        
+        /* Si le bloc contient EOT, la transmission est terminée */
+        if (block_buffer[0] == EOT)
+        {
+            YMODEM_SendACK();
+            break;
+        }
+        
+        /* Vérification du numéro de bloc attendu */
+        if (block_no == (uint8_t)(context.block_number + 1U))
+        {
+            context.block_number = block_no;
+            context.bytes_received += block_size;
+            
+            /* Accumulation dans le tampon flash */
+            for (uint16_t i = 0; i < block_size; i++)
+            {
+                flash_buffer[flash_buffer_index++] = block_buffer[i];
+                if (flash_buffer_index >= FLASH_SECTOR_SIZE)
+                {
+                    if (Flash_WriteSector(flash_address, flash_buffer, FLASH_SECTOR_SIZE) != 0)
+                    {
+                        return -1;
+                    }
+                    flash_address += FLASH_SECTOR_SIZE;
+                    flash_buffer_index = 0;
+                }
+            }
+            YMODEM_SendACK();
+        }
+        else
+        {
+            /* Bloc hors séquence ou dupliqué */
+            YMODEM_SendACK();
+        }
+    }
+    
+    /* Si des données restent dans le tampon, compléter et écrire en flash */
+    if (flash_buffer_index > 0)
+    {
+        memset(&flash_buffer[flash_buffer_index], 0xFF, FLASH_SECTOR_SIZE - flash_buffer_index);
+        if (Flash_WriteSector(flash_address, flash_buffer, FLASH_SECTOR_SIZE) != 0)
+        {
+            return -1;
+        }
+    }
+    
+    return 0;
+}
